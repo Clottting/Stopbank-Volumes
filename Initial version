@@ -1,0 +1,384 @@
+import arcpy
+import math
+import numpy as np
+import os
+
+arcpy.env.overwriteOutput = True
+arcpy.CheckOutExtension("3D")
+arcpy.CheckOutExtension("Spatial")
+
+print("🟢 Starting processing...")
+
+# --- Inputs ---
+centreline = r"F:\\Regional DEM and Arcpro\\StopbanksSegmented.shp"
+dem = r"F:\\Regional DEM and Arcpro\\Full DEM\\DEMFull.tif"
+gdb_path = r"F:\\Arcpro\\Assets\\Assets Python\\Outputs\\StopbankData.gdb"
+output_name = "Stopbank_ProfilePoints"
+output_points = os.path.join(gdb_path, output_name)
+
+interval = 5  # spacing along centreline (metres)
+sample_spacing = 0.75  # spacing outwards from centreline (metres)
+max_sample_dist = 20  # max sampling distance from centreline
+max_chainage = None  # max length of chainage to sample (None means full segment)
+
+# --- Feature toggles ---
+export_centreline = True
+export_crest = True
+export_toe = True
+export_lofted_polygons = True
+export_toe_polygon = False
+export_tins = False
+export_toe_tin = False
+export_volume_summary = False
+add_outputs_to_maps = True
+
+# --- Thresholds ---
+crest_thresh = -3       # % grade for detecting crest
+toe_flat_thresh = 5     # % grade considered "flat" for toe
+toe_weak_slope_ratio_list = [1.0]  # try multiple ratios
+smoothing_window = 4    # number of points used in smoothing
+smoothing_drop_ratio = 0.2  # position to drop point in flattening window
+
+# --- Filter for WCRCID ---
+target_wcrcids = ["RED-04600"]  # Partial match filter list for multiple WCRCIDs
+
+# --- Append max_chainage to outputs ---
+chainage_tag = f"_{max_chainage}m" if max_chainage is not None else "_Full"
+
+# --- Create output feature class ---
+spatial_ref = arcpy.Describe(centreline).spatialReference
+if not arcpy.Exists(gdb_path):
+    print("Creating file geodatabase...")
+    arcpy.CreateFileGDB_management(os.path.dirname(gdb_path), os.path.basename(gdb_path))
+if arcpy.Exists(output_points):
+    print(f"🔸 Deleting existing {output_points}")
+    arcpy.Delete_management(output_points)
+print("Creating new profile points feature class...")
+arcpy.CreateFeatureclass_management(gdb_path, output_name, "POINT", spatial_reference=spatial_ref, has_z="ENABLED")
+arcpy.AddField_management(output_points, "Side", "TEXT")
+arcpy.AddField_management(output_points, "Chainage", "DOUBLE")
+arcpy.AddField_management(output_points, "WCRCID", "TEXT")
+arcpy.AddField_management(output_points, "InitialC_3", "DOUBLE")
+
+fields = [f.name for f in arcpy.ListFields(centreline) if f.type not in ('OID', 'Geometry')]
+for f in fields:
+    if f not in ["Side", "Chainage", "WCRCID", "InitialC_3"]:
+        arcpy.AddField_management(output_points, f, "TEXT")
+
+# --- Elevation from DEM with caching ---
+elevation_cache = {}
+def get_elevation(x, y):
+    key = (round(x, 3), round(y, 3))
+    if key in elevation_cache:
+        return elevation_cache[key]
+    result = arcpy.GetCellValue_management(dem, f"{x} {y}")
+    try:
+        val = float(result.getOutput(0))
+        elevation_cache[key] = val
+        return val
+    except:
+        return None
+
+# --- Extract 1D profile from DEM ---
+def extract_profile(pt, vx, vy, spacing=1.0, max_dist=20):
+    distances = []
+    elevations = []
+    dist = 0
+    while dist <= max_dist:
+        x = pt.X + vx * dist
+        y = pt.Y + vy * dist
+        elev = get_elevation(x, y)
+        if elev is None:
+            break
+        distances.append(dist)
+        elevations.append(elev)
+        dist += spacing
+    return np.array(distances), np.array(elevations)
+
+# --- Crest and toe detection using slope thresholds ---
+def detect_breaks(distances, elevations, label=None):
+    if len(elevations) < 5:
+        return None, None
+
+    smoothed_elevs = np.convolve(elevations, np.ones(smoothing_window)/smoothing_window, mode='same')
+    slope = np.gradient(smoothed_elevs, distances)
+    slope_percent = slope * 100
+    slope_percent = np.clip(slope_percent, -100, 100)
+
+    crest_candidates = np.where(slope_percent < crest_thresh)[0]
+    crest_idx = crest_candidates[0] if len(crest_candidates) > 0 else None
+
+    toe_idx_results = []
+    for ratio in toe_weak_slope_ratio_list:
+        toe_idx = None
+        if crest_idx is not None:
+            for j in range(crest_idx + 1, len(slope_percent) - 3):
+                if all(abs(slope_percent[j + k]) < abs(slope_percent[j + k - 1]) for k in range(1, 3)):
+                    toe_idx = j + int(ratio * 3)
+                    break
+        toe_idx_results.append(toe_idx)
+
+    if label:
+        print(f"{label} Slope (% grade): {np.round(slope_percent, 2)}")
+    return crest_idx, toe_idx_results
+
+# --- Determine number of samples safely ---
+def compute_num_samples(length):
+    return int(min(length, max_chainage) // interval) if max_chainage is not None else int(length // interval)
+
+# --- Volume Calculation Helper ---
+def calculate_volume(loft_tin, toe_tin, wcrcid):
+    try:
+        base_name = wcrcid.replace("-", "_")
+        loft_raster = f"in_memory/loft_{base_name}"
+        toe_raster = f"in_memory/toe_{base_name}"
+        cutfill_raster = os.path.join(gdb_path, f"CutFill_{base_name}")
+
+        # Convert TINs to rasters
+        arcpy.ddd.TinRaster(loft_tin, loft_raster, "FLOAT", "LINEAR", "CELLSIZE", 1)
+        arcpy.ddd.TinRaster(toe_tin, toe_raster, "FLOAT", "LINEAR", "CELLSIZE", 1)
+
+        # Delete old CutFill if it exists
+        if arcpy.Exists(cutfill_raster):
+            arcpy.Delete_management(cutfill_raster)
+
+        # Run CutFill
+        arcpy.ddd.CutFill(loft_raster, toe_raster, cutfill_raster)
+
+        # Sum volumes
+        total_volume = 0.0
+        with arcpy.da.SearchCursor(cutfill_raster, ["VOLUME"]) as cur:
+            for row in cur:
+                total_volume += row[0]
+
+        # Store in shapefile
+        with arcpy.da.UpdateCursor(centreline, ["WCRCID", "InitialFil"]) as cursor:
+            for row in cursor:
+                if row[0] == wcrcid:
+                    row[1] = total_volume
+                    cursor.updateRow(row)
+
+        print(f"✅ Volume stored: {round(total_volume, 2)} m³ for {wcrcid}")
+        return total_volume
+
+    except Exception as e:
+        print(f"❌ Volume calculation failed for {wcrcid}: {e}")
+        return None
+
+print("✅ Script setup complete.")
+
+# --- Store output per WCRCID ---
+outputs_by_wcrcid = {}
+
+# --- Main logic ---
+print("Processing lines...")
+with arcpy.da.InsertCursor(output_points, ["SHAPE@", "Side", "Chainage", "WCRCID", "InitialC_3"] + fields) as cursor:
+    with arcpy.da.SearchCursor(centreline, ["SHAPE@", "WCRCID"] + fields) as line_cursor:
+        for row in line_cursor:
+            line, wcrcid = row[0], row[1]
+            attr_vals = row[2:]
+
+            if target_wcrcids and all(sub not in wcrcid for sub in target_wcrcids):
+                continue
+
+            print(f"🔍 Working on {wcrcid}...")
+            length = line.length
+            limit = min(length, max_chainage) if max_chainage is not None else length
+            # Always include final chainage even if not evenly divisible
+            sample_chainages = list(np.arange(0, limit, interval))
+
+            # Ensure final chainage is added if it's not already present
+            if not math.isclose(sample_chainages[-1], limit, abs_tol=0.01) and limit > sample_chainages[-1]:
+                sample_chainages.append(limit)
+
+
+            all_loft_points = []
+            toe_only_left = []
+            toe_only_right = []
+            profile_lines = []
+            toe_polygons = []
+            toe_tin_pts = []
+
+            for chainage in sample_chainages:
+                pt = line.positionAlongLine(chainage).firstPoint
+
+                # 🔁 Replace old direction logic with this:
+                if chainage == 0:
+                    pt_next = line.positionAlongLine(chainage + 0.01).firstPoint
+                    dx = pt_next.X - pt.X
+                    dy = pt_next.Y - pt.Y
+                elif chainage >= length:
+                    pt_prev = line.positionAlongLine(chainage - 0.01).firstPoint
+                    dx = pt.X - pt_prev.X
+                    dy = pt.Y - pt_prev.Y
+                else:
+                    pt_next = line.positionAlongLine(chainage + 0.01).firstPoint
+                    pt_prev = line.positionAlongLine(chainage - 0.01).firstPoint
+                    dx = pt_next.X - pt_prev.X
+                    dy = pt_next.Y - pt_prev.Y
+                    
+                mag = math.hypot(dx, dy)
+                if mag == 0:
+                    continue
+                dx /= mag
+                dy /= mag
+
+                left_vx, left_vy = -dy, dx
+                right_vx, right_vy = dy, -dx
+
+                crest_left = crest_right = toe_left = toe_right = cl_point = None
+
+                for side, vx, vy in [("Left", left_vx, left_vy), ("Right", right_vx, right_vy)]:
+                    dists, elevs = extract_profile(pt, vx, vy, sample_spacing, max_sample_dist)
+                    if len(dists) == 0 or len(elevs) == 0:
+                        continue
+
+                    label = f"Chainage {chainage:.2f}m {side} ({wcrcid})"
+                    crest_idx, toe_idx_list = detect_breaks(dists, elevs, label=label)
+
+                    if export_toe:
+                        for k, toe_idx in enumerate(toe_idx_list):
+                            if toe_idx is not None and toe_idx < len(dists):
+                                if crest_idx is None or toe_idx > crest_idx:
+                                    x = pt.X + vx * dists[toe_idx]
+                                    y = pt.Y + vy * dists[toe_idx]
+                                    z = get_elevation(x, y)
+                                    p = arcpy.Point(x, y, z)
+                                    if side == "Left":
+                                        toe_left = p
+                                        toe_only_left.append((chainage, p))
+                                    else:
+                                        toe_right = p
+                                        toe_only_right.append((chainage, p))
+                                    toe_tin_pts.append(arcpy.PointGeometry(p, spatial_ref, has_z=True))
+                                    cursor.insertRow([p, f"{side}ToeR{toe_weak_slope_ratio_list[k]}", chainage, wcrcid, z] + list(attr_vals))
+
+                    if export_crest and crest_idx is not None:
+                        x = pt.X + vx * dists[crest_idx]
+                        y = pt.Y + vy * dists[crest_idx]
+                        z = get_elevation(x, y)
+                        p = arcpy.Point(x, y, z)
+                        if side == "Left": crest_left = p
+                        else: crest_right = p
+                        cursor.insertRow([p, f"{side}Crest", chainage, wcrcid, z] + list(attr_vals))
+
+                if export_centreline:
+                    z = get_elevation(pt.X, pt.Y)
+                    cl_point = arcpy.Point(pt.X, pt.Y, z)
+                    cursor.insertRow([cl_point, "Centre", chainage, wcrcid, z] + list(attr_vals))
+
+                if export_lofted_polygons and all(p is not None for p in [toe_left, crest_left, cl_point, crest_right, toe_right]):
+                    profile_line = arcpy.Polyline(arcpy.Array([toe_left, crest_left, cl_point, crest_right, toe_right]), spatial_ref, has_z=True)
+                    profile_lines.append(profile_line)
+
+            base_name = wcrcid.replace("-", "_")
+
+            if export_toe_polygon and toe_only_left and toe_only_right:
+                print(f"Generating toe polygon and outline for {wcrcid}...")
+
+                # --- Deduplicate by chainage ---
+                def dedupe_by_chainage(toe_list):
+                    seen = set()
+                    clean = []
+                    for ch, pt in sorted(toe_list, key=lambda t: t[0]):
+                        key = round(ch, 3)
+                        if key not in seen:
+                            clean.append((ch, pt))
+                            seen.add(key)
+                    return clean
+
+
+
+                toe_only_left = dedupe_by_chainage(toe_only_left)
+                toe_only_right = dedupe_by_chainage(toe_only_right)
+
+                # --- Sort after deduplication ---
+                toe_only_left.sort(key=lambda t: t[0])
+                toe_only_right.sort(key=lambda t: t[0], reverse=True)
+                
+                print("LEFT toe chainages:", [round(ch, 2) for ch, _ in toe_only_left[-3:]])
+                print("RIGHT toe chainages:", [round(ch, 2) for ch, _ in toe_only_right[:3]])
+
+                # --- Generate geometry ---
+                full_toe_ring = [p for _, p in toe_only_left + toe_only_right]
+                if full_toe_ring:
+                    toe_polygon = arcpy.Polygon(arcpy.Array(full_toe_ring), spatial_ref, has_z=True)
+                    toe_poly_fc = os.path.join(gdb_path, f"ToePolygon_{base_name}")
+                    if arcpy.Exists(toe_poly_fc):
+                        print(f"🔸 Deleting existing {toe_poly_fc}")
+                        arcpy.Delete_management(toe_poly_fc)
+                    arcpy.CopyFeatures_management([toe_polygon], toe_poly_fc)
+                    print(f"✅ Toe polygon created: {toe_poly_fc}")
+
+                    toe_outline_fc = os.path.join(gdb_path, f"ToeOutline_{base_name}")
+                    if arcpy.Exists(toe_outline_fc):
+                        print(f"🔸 Deleting existing {toe_outline_fc}")
+                        arcpy.Delete_management(toe_outline_fc)
+
+                    # Close ring
+                    left_points = [p for _, p in toe_only_left]
+                    right_points = [p for _, p in toe_only_right]
+
+                    # 🧭 Final toe points
+                    print("🧭 Final toe points:")
+                    print(f"  Left: ({left_points[-1].X:.2f}, {left_points[-1].Y:.2f})")
+                    print(f"  Right: ({right_points[0].X:.2f}, {right_points[0].Y:.2f})")
+
+                    # Avoid duplicate ring closure
+                    if not (math.isclose(left_points[0].X, right_points[-1].X, abs_tol=0.01) and 
+                            math.isclose(left_points[0].Y, right_points[-1].Y, abs_tol=0.01)):
+                        ordered_ring = left_points + right_points + [left_points[0]]
+                    else:
+                        ordered_ring = left_points + right_points
+
+                    toe_outline_array = arcpy.Array(ordered_ring)
+                    toe_outline_line = arcpy.Polyline(toe_outline_array, spatial_ref, has_z=True)
+                    arcpy.CopyFeatures_management([toe_outline_line], toe_outline_fc)
+                    print(f"✅ Toe breakline polyline created: {toe_outline_fc}")
+
+
+            if export_tins and profile_lines:
+                print(f"Creating loft TIN for {wcrcid}...")
+                loft_fc = os.path.join(gdb_path, f"LoftProfiles_{base_name}")
+                if arcpy.Exists(loft_fc):
+                    print(f"🔸 Deleting existing {loft_fc}")
+                    arcpy.Delete_management(loft_fc)
+                arcpy.CopyFeatures_management(profile_lines, loft_fc)
+
+                loft_tin = os.path.join(gdb_path, f"LoftTIN_{base_name}")
+                if arcpy.Exists(loft_tin):
+                    print(f"🔸 Deleting existing {loft_tin}")
+                    arcpy.Delete_management(loft_tin)
+                arcpy.CreateTin_3d(loft_tin, spatial_ref, [[loft_fc, "Shape.Z", "Soft_Line"], [toe_outline_fc, "Shape.Z", "Hard_Line"]])
+                print(f"✅ Loft TIN created: {loft_tin}")
+
+            if export_toe_tin and toe_tin_pts:
+                print(f"Creating toe TIN for {wcrcid}...")
+                toe_pts_fc = os.path.join(gdb_path, f"ToeTIN_Points_{base_name}")
+                if arcpy.Exists(toe_pts_fc):
+                    print(f"🔸 Deleting existing {toe_pts_fc}")
+                    arcpy.Delete_management(toe_pts_fc)
+                arcpy.CopyFeatures_management(toe_tin_pts, toe_pts_fc)
+
+                toe_tin = os.path.join(gdb_path, f"ToeTIN_{base_name}")
+                if arcpy.Exists(toe_tin):
+                    print(f"🔸 Deleting existing {toe_tin}")
+                    arcpy.Delete_management(toe_tin)
+                arcpy.CreateTin_3d(toe_tin, spatial_ref, [[toe_pts_fc, "Shape.Z", "Mass_Points"], [toe_outline_fc, "Shape.Z", "Hard_Line"]])
+                print(f"✅ Toe TIN created: {toe_tin}")
+                
+# --- Call volume calculation ---
+if export_volume_summary and export_tins and export_toe_tin:
+    total_volume = calculate_volume(loft_tin, toe_tin, wcrcid)
+
+# Add and store volume in polygon feature
+if export_volume_summary and 'total_volume' in locals():
+    if not any(f.name == "Volume_m3" for f in arcpy.ListFields(toe_poly_fc)):
+        arcpy.AddField_management(toe_poly_fc, "Volume_m3", "DOUBLE")
+    with arcpy.da.UpdateCursor(toe_poly_fc, ["Volume_m3"]) as cursor:
+        for row in cursor:
+            row[0] = round(total_volume, 2)
+            cursor.updateRow(row)
+    print(f"📌 Volume stored in toe polygon: {round(total_volume, 2)} m³")
+
+print("\n🎉 Processing complete for all selected WCRCIDs.")
